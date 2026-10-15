@@ -1,159 +1,10 @@
-﻿# Setup and Validation Notebook Patterns
+﻿# Setup and Validation Script Patterns
 
-## Databricks Notebook Format
+## File Format
 
-Every setup and validation file must be a valid Databricks notebook regardless of the `.py` extension. Separate cells with `# COMMAND ----------`.
-
-**Setup notebook** — include `environment_version = "5"` in the script block. Omit `base_environment`; the workspace default now covers it:
-
-```python
-# Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "5"
-# ///
-# Integration Test - <initiative> - Setup Context
-# <one-line description>
-
-import json
-
-from pltdata import Drl, LakeConnectFactory
-from pltdata.schema import Layer
-from pyspark.sql import functions as F
-
-# COMMAND ----------
-
-def resolve_table(...):
-    ...
-
-def require_first(df, scenario: str, order_columns: list[str]):
-    rows = df.orderBy(*order_columns).limit(1).collect()
-    assert rows, f"[FAIL] {scenario} | no stable source/target pair was found"
-    return rows[0]
-
-def my_scenario() -> dict:
-    ...
-
-# COMMAND ----------
-
-print("[START] setup_<initiative> | mode=observational | scope=...")
-
-scenarios = {
-    "scenario_a": my_scenario(),
-}
-
-# Coverage metadata — logged but excluded from exit value to stay within
-# widget parameter size limits used by validate_<initiative>.
-coverage = {
-    "scenario_a": {"disposition": "OBSERVATIONAL", "entities": [...], "reason": "..."},
-}
-print(f"[INFO] Coverage: {json.dumps(coverage, default=str)}")
-
-context = {
-    "initiative": "<initiative>",
-    "mode": "observational",
-    "scenarios": scenarios,
-}
-setup_result = json.dumps(context, default=str)
-print(f"[OK] <initiative> consolidated context ({len(setup_result)} chars): {setup_result}")
-dbutils.notebook.exit(setup_result)  # noqa: F821
-```
-
-**Validate notebook** — no `# /// script` block:
-
-```python
-# Databricks notebook source
-# Integration Test - <initiative> - Consolidated Validation
-# Runs every scenario independently and reports all failures together.
-
-import json
-
-from pyspark.sql import functions as F
-
-# COMMAND ----------
-
-DATE_KEY_FIELDS: set[str] = set()  # add date-type key columns for this initiative
-
-def filter_by_key(df, key: dict):
-    result = df
-    for field_name, expected_value in key.items():
-        if expected_value is None:
-            result = result.filter(F.col(field_name).isNull())
-        elif field_name in DATE_KEY_FIELDS:
-            # Date-type columns must be cast to string for comparison with stored string values
-            result = result.filter(
-                F.col(field_name).cast("string") == F.lit(str(expected_value))
-            )
-        else:
-            result = result.filter(F.col(field_name) == F.lit(expected_value))
-    return result
-
-def normalized(value):
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
-
-def assert_expected_fields(row, expected: dict, scenario_name: str) -> None:
-    for field_name, expected_value in expected.items():
-        actual_value = normalized(row[field_name])
-        assert actual_value == expected_value, (
-            f"[FAIL] {scenario_name} | {field_name} expected={expected_value!r} "
-            f"got={actual_value!r}"
-        )
-
-def validate_scenario(scenario_name: str, scenario: dict) -> None:
-    target_table = scenario["target_table"]
-    key = scenario["key"]
-    print(f"[SECTION] {scenario_name} | target={target_table} | key={key}")
-    result = filter_by_key(spark.table(target_table), key)  # noqa: F821
-    count = result.count()
-    assert count == 1, (
-        f"[FAIL] {scenario_name} | expected exactly one row for key={key}, found={count}"
-    )
-    assert_expected_fields(result.first(), scenario["expected"], scenario_name)
-
-# COMMAND ----------
-
-try:
-    dbutils.widgets.text("setup_result", "")  # noqa: F821
-    setup_result = dbutils.widgets.get("setup_result")  # noqa: F821
-except Exception:
-    setup_result = ""
-
-assert setup_result, "[FAIL] setup_result is required. Run setup_<initiative> and copy its JSON output to the widget."
-context = json.loads(setup_result)
-scenarios = context.get("scenarios", {})
-
-EXPECTED_SCENARIOS = {"scenario_a", "scenario_b"}
-assert set(scenarios) == EXPECTED_SCENARIOS, (
-    f"[FAIL] <initiative> scenarios expected={sorted(EXPECTED_SCENARIOS)} "
-    f"got={sorted(scenarios)}"
-)
-
-print("[START] validate_<initiative> | scope=... | boundary=...")
-
-results = {}
-failures = []
-for name in sorted(scenarios):
-    try:
-        validate_scenario(name, scenarios[name])
-        results[name] = "PASS"
-    except Exception as exc:
-        results[name] = "FAIL"
-        failures.append({"scenario": name, "error": str(exc)})
-        print(f"[FAIL] {name} | {exc}")
-
-print("\n[SUMMARY] <initiative>")
-for name in sorted(results):
-    print(f"[{results[name]}] {name}")
-
-assert not failures, f"[FAIL] <initiative> scenario failures: {failures}"
-print("[DONE] validate_<initiative> - all scenarios passed")
-```
+Setup and validation scripts are plain Python files (no Databricks notebook format, no `# COMMAND ----------`, no `dbutils`, no `spark.table()`). They run locally with the mock pltdata framework and a local PySpark session.
 
 ## Naming
-
-Use lowercase snake case:
 
 ```text
 databricks/tests/integration/<initiative>/
@@ -161,101 +12,200 @@ databricks/tests/integration/<initiative>/
   validate_<initiative>.py
 ```
 
-Prefer the same initiative value for the folder, filenames, and config entry.
+## Setup Script
 
-## Coverage — Log Only, Do Not Exit With It
-
-The `dbutils.notebook.exit()` value is passed as a widget parameter to the validate notebook. Widget parameters have a size limit. Keep coverage metadata out of the exit JSON — log it with `print` only:
+The setup script builds in-memory synthetic DataFrames and runs the full transformation chain. It exposes a `_result` dict that the runner passes to the validate script.
 
 ```python
-# RIGHT — coverage logged separately
-coverage = {"path_a": {"disposition": "EXCLUDED", "reason": "..."}}
-print(f"[INFO] Coverage: {json.dumps(coverage, default=str)}")
+"""
+Integration Test — <initiative> — Setup
+Builds synthetic source data, runs the transformation chain, and
+exposes _result for the validate script.
+"""
+import sys, os
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
-context = {"initiative": "...", "mode": "...", "scenarios": scenarios}
-dbutils.notebook.exit(json.dumps(context, default=str))
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import StringType, StructField, StructType, TimestampType
 
-# WRONG — coverage bloats the exit value
-context = {"initiative": "...", "scenarios": scenarios, "coverage": coverage}
-dbutils.notebook.exit(json.dumps(context, default=str))
-```
+from pltdata import (
+    Attribute, AttrType, Entity, EntityProperty, EntityType,
+    Layer, Parameter, RetentionDuration,
+)
 
-## Serving Scenario Embedded in Parent Function
+# ---------------------------------------------------------------------------
+# Spark session
+# ---------------------------------------------------------------------------
+spark = (
+    SparkSession.builder
+    .master("local[1]")
+    .appName("integration-test-<initiative>-setup")
+    .config("spark.sql.shuffle.partitions", "1")
+    .getOrCreate()
+)
 
-When a serving scenario is derived from the same join as a curated scenario, embed it in the curated scenario function and pop it out at the call site:
+print("[START] setup_<initiative> | mode=controlled | scope=<layers>")
 
-```python
-def lead_opportunity_scenario() -> dict:
-    ...
+# ---------------------------------------------------------------------------
+# Entity definitions (verbatim from source notebooks)
+# ---------------------------------------------------------------------------
+# ... copy Entity(...) constructors here ...
+
+# ---------------------------------------------------------------------------
+# Transformation functions (extracted from source notebooks)
+# ---------------------------------------------------------------------------
+# ... copy apply_<layer>_transform functions here ...
+
+# ---------------------------------------------------------------------------
+# Scenario: <scenario_name>
+# Unique test key: <TEST_KEY> — reserved for integration tests only
+# ---------------------------------------------------------------------------
+TEST_KEY = "INT_TEST_001"
+
+def scenario_<name>() -> dict:
+    """Build synthetic data, run the chain, collect results for validation."""
+    # 1. Build source fixture
+    source_data = spark.createDataFrame([
+        (TEST_KEY, "Alice", "Smith", ...),
+    ], schema=_RAW_SCHEMA)
+
+    # 2. Run transformation chain
+    staging_df  = apply_staging_transform(source_data)
+    enriched_df = apply_enriched_transform(staging_df)
+    curated_df  = apply_curated_transform(enriched_df)
+
+    # 3. Collect one result row keyed on the test identity
+    rows = curated_df.filter(F.col("employee_id") == TEST_KEY).collect()
+    assert rows, f"[FAIL] scenario_<name> | no curated row found for key={TEST_KEY!r}"
+    row = rows[0]
+
     return {
-        "disposition": "OBSERVATIONAL",
-        "source_table": source_table,
-        "target_table": target_table,
-        "key": {...},
-        "expected": {...},
-        "serving_scenario": {           # <-- embedded serving context
-            "disposition": "OBSERVATIONAL",
-            "source_table": target_table,
-            "target_table": serving_table,
-            "key": {"sub_business_unit": row["sub_business_unit"]},
-            "expected": {"sub_business_unit_key": row["sub_business_unit_key"]},
+        "disposition": "CONTROLLED",
+        "key": {"employee_id": TEST_KEY},
+        "actual": {
+            "full_name":    row.full_name,
+            "salary_band":  row.salary_band,
+            "is_active":    row.is_active,
+            "has_manager":  row.has_manager,
         },
     }
 
-# At call site — pop so scenarios dict stays flat
-lead_opportunity = lead_opportunity_scenario()
-generic_sub_business_unit = lead_opportunity.pop("serving_scenario")
-
-scenarios = {
-    "lead_opportunity": lead_opportunity,
-    "generic_sub_business_unit_serving": generic_sub_business_unit,
+# ---------------------------------------------------------------------------
+# Coverage metadata — printed only, not included in _result
+# ---------------------------------------------------------------------------
+coverage = {
+    "raw_ingestion":  {"disposition": "EXCLUDED",    "reason": "Synthetic data; raw ingestion adapter not exercised"},
+    "staging":        {"disposition": "CONTROLLED",  "entities": ["employees"]},
+    "enriched":       {"disposition": "CONTROLLED",  "entities": ["mockapi_employees"]},
+    "curated":        {"disposition": "CONTROLLED",  "entities": ["employee_profile"]},
 }
+print(f"[INFO] Coverage: {coverage}")
+
+# ---------------------------------------------------------------------------
+# Execute scenarios and expose _result for the runner
+# ---------------------------------------------------------------------------
+scenarios = {
+    "scenario_<name>": scenario_<name>(),
+}
+
+_result = {
+    "initiative": "<initiative>",
+    "mode": "controlled_test_data",
+    "scenarios": scenarios,
+}
+print(f"[OK] setup_<initiative> — scenarios: {list(scenarios.keys())}")
 ```
 
-## Date Key Fields in filter_by_key
+### Scenario design rules
 
-Date-type columns (e.g., `at_date`, `visit_start_date`) stored as Spark `DateType` cannot be compared directly to a string literal from the JSON context. Define `DATE_KEY_FIELDS` at the top of the validate notebook and cast to string in `filter_by_key`:
+- Use a unique, reserved test key (e.g., `INT_TEST_001`) that cannot collide with production data.
+- Call transformation functions directly; do not import or execute source notebooks.
+- Collect exactly the fields needed by the validate script — keep `actual` small.
+- Include at least one row per significant branch (active/inactive, with/without manager, etc.).
+- For multi-input transforms, design one independent identity per input path so one cannot mask another.
+
+## Validate Script
+
+The validate script receives `setup_result` (the `_result` dict from setup) as a builtin and asserts on the values collected during setup.
 
 ```python
-DATE_KEY_FIELDS = {"at_date", "visit_start_date"}
+"""
+Integration Test — <initiative> — Validation
+Asserts on values captured by the setup script.
+"""
+
+# setup_result is injected by the runner as a builtin
+assert isinstance(setup_result, dict), "[FAIL] setup_result not provided"
+
+scenarios = setup_result.get("scenarios", {})
+EXPECTED_SCENARIOS = {"scenario_<name>"}
+assert set(scenarios) == EXPECTED_SCENARIOS, (
+    f"[FAIL] expected scenarios {sorted(EXPECTED_SCENARIOS)}, "
+    f"got {sorted(scenarios)}"
+)
+
+print("[START] validate_<initiative> | boundary=curated")
+
+failures = []
+results  = {}
+
+def validate_scenario(name: str, scenario: dict) -> None:
+    actual   = scenario["actual"]
+    expected = {
+        "full_name":   "Alice Smith",
+        "salary_band": "Band 2",
+        "is_active":   True,
+        "has_manager": True,
+    }
+    for field, exp_val in expected.items():
+        got = actual.get(field)
+        assert got == exp_val, (
+            f"[FAIL] {name} | {field} expected={exp_val!r} got={got!r}"
+        )
+
+for name in sorted(scenarios):
+    try:
+        validate_scenario(name, scenarios[name])
+        results[name] = "PASS"
+    except AssertionError as exc:
+        results[name] = "FAIL"
+        failures.append({"scenario": name, "error": str(exc)})
+        print(f"[FAIL] {name} | {exc}")
+
+print("\n[SUMMARY] <initiative>")
+for name in sorted(results):
+    print(f"  [{results[name]}] {name}")
+
+assert not failures, f"[FAIL] <initiative> scenario failures: {failures}"
+print("[DONE] validate_<initiative> — all scenarios passed")
 ```
 
-Add any date-type key column for the initiative to this set.
+### Assertion rules
 
-## Setup Notebook
+- Assert on specific field values, not row counts.
+- Every asserted field must be fatal — do not downgrade to a warning.
+- For multi-scenario runs, collect all results before asserting so every scenario reports its status.
+- Write failure messages that include the scenario name, field, expected value, and actual value.
+- Avoid assertions on current timestamps or mutable values not set by the test.
 
-The template above shows observational mode (read-only, no fixtures). For controlled mode (DEV, fixture-based), replace the scenario functions with fixture writers and apply the following rules:
+## Coverage — Print Only, Not in _result
 
-- create a clearly identifiable test key (e.g. a reserved negative ID range)
-- use a unique per-run marker for incremental serving or export flows
-- insert or merge only into a safe CQ-owned anchor
-- prepare owned lookup dependencies or select eligible stable read-only rows
-- ensure incremental conditions include the fixture
-- avoid duplicates across reruns
+Keep coverage metadata out of `_result`. Print it from the setup script:
 
-For observational setup: select a stable row using deterministic ordering and ensure it already exists at the intended validation checkpoint.
+```python
+# RIGHT — coverage logged only
+coverage = {"raw": {"disposition": "EXCLUDED", "reason": "external adapter"}}
+print(f"[INFO] Coverage: {coverage}")
+_result = {"initiative": "...", "mode": "...", "scenarios": scenarios}
 
-Use `require_first(df, scenario, order_columns)` to select a deterministic row and assert it exists.
+# WRONG — coverage bloats _result
+_result = {"initiative": "...", "scenarios": scenarios, "coverage": coverage}
+```
 
-Keep all initiative preparation in this notebook. Do not create additional setup notebook fields or change the runner.
+## Running the Suite
 
-## Validation Notebook
-
-Read the runner widgets and parse `setup_result`. Resolve tables using repository DRL or entity patterns rather than guessed physical names.
-
-Use fatal assertions for the declared boundary. Validate as applicable:
-
-- record existence by the test identity
-- critical field mappings
-- joins and lookup resolution
-- filters and deduplication
-- target keys and identity maps
-- incremental timestamps
-
-Write failure messages that include the layer, entity, key, expected value, and actual value when possible.
-
-Avoid fragile assertions based on full-table row counts, unordered results, exact current timestamps, or mutable production values.
-
-Do not make an in-scope downstream assertion non-fatal. If a downstream system is intentionally excluded, state the boundary and reason instead.
-
-For multiple scenarios, execute every scenario, collect its result, print one summary, and assert once at the end. A failure in one scenario must not prevent other scenario validations from reporting their status. Keep the single validation notebook required by the runner.
+```powershell
+# From demo/ root
+$env:PYTHONPATH = "$PWD;$env:PYTHONPATH"
+python databricks/tests/integration/common/run_integration_suite.py --initiative <name> --env dev
+```

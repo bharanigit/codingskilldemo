@@ -1,17 +1,26 @@
 ---
 name: create-integration-tests
-description: Create or maintain full-initiative, config-driven Databricks integration tests from local development or Claude Code. Author setup and validation notebooks and integration_tests.json entries for pipeline execution after deployment, preserving the single-workflow suite contract. Use for new initiatives, added or modified production notebooks, and coverage gaps.
+description: Create or maintain full-initiative, config-driven integration tests. Authors setup and validation Python scripts and integration_tests.json entries for pipeline execution. Bootstraps the suite runner and config when they do not exist. Works without compiled artifacts or a live Databricks cluster.
 ---
 
 # Create Integration Tests
 
-Analyze the complete initiative, account for every discovered production path, and implement all safely testable scenarios that fit the fixed shared suite contract. Design tests to exercise deployed production code through the single configured production workflow.
+Analyze the complete initiative, account for every discovered production path, and implement all safely testable end-to-end scenarios. Design tests to exercise the initiative's transformation chain from a controlled source anchor through to the curated output, using the mock pltdata framework locally.
 
 ## Author Files and Defer Execution
 
-This skill creates or updates repository files and performs static checks. Integration-test execution belongs to a developer-started pipeline run after deployment. Do not execute or import setup notebooks, validation notebooks, or the suite runner. Do not trigger production workflows or the integration pipeline, or deploy files as part of authoring tests.
+This skill creates or updates repository files and performs static checks. Integration-test execution belongs to a developer-started pipeline run after authoring. Do not execute setup or validation scripts inline.
 
-Repository compilation is allowed when current compiled references are missing or stale. Compilation is separate from deployment and test execution. Runtime actions described in this skill and its references, including fixture writes and validation queries, describe behavior to implement in the generated notebooks for pipeline execution.
+## Bootstrap Infrastructure When Absent
+
+Before authoring initiative tests, inspect:
+
+```text
+databricks/tests/integration/common/run_integration_suite.py
+databricks/tests/integration/config/integration_tests.json
+```
+
+If either is missing, **create both** before registering any initiative. Follow the templates in `references/runner-and-config.md`. This is a one-time bootstrap step, not a redesign — the created runner and schema become the shared suite contract for all future initiatives.
 
 ## Read References Selectively
 
@@ -19,85 +28,49 @@ Always read:
 
 - `references/coverage-planning.md` before deciding implementation scope.
 - `references/test-design.md` before choosing the test anchor or test type.
-- `references/runner-and-config.md` before editing the suite configuration.
-
-Read when applicable:
-
-- `references/genie-code-workflow.md` whenever operating in Claude Code or resolving missing or stale compiled artifacts.
-- `references/workflow-verification.md` whenever selecting or verifying a production workflow.
-- `references/notebook-patterns.md` before creating or changing setup and validation notebooks.
-
-Do not rely on remembered architecture. Rebuild the initiative lineage from the repository.
+- `references/runner-and-config.md` before editing the suite configuration or creating the runner.
+- `references/notebook-patterns.md` before creating or changing setup and validation scripts.
 
 ## Inspect the Repository
 
 Inspect at minimum:
 
-- `databricks/tests/integration/common/run_integration_suite.py`
-- `databricks/tests/integration/config/integration_tests.json`
-- Existing initiative tests under `databricks/tests/integration/`
-- The initiative's production transforms across all relevant layers
-- `.config/module.json`
-- Current compiled functions under `databricks/lib/integration-lib/integration/bin/`, using the Claude Code reference for Shared discovery and compilation fallback
-- Generated or deployed workflow tasks when available
-- Entity, schema, DRL, lookup, and SQL-view definitions used by every initiative path
+- The integration test runner and config (create if absent — see bootstrap step above).
+- Existing initiative tests under `databricks/tests/integration/`.
+- The initiative's production transforms across all relevant layers.
+- Entity definitions, attribute types, and transformation logic in each notebook.
 
-Inspect the CI/CD pipeline YAML under `databricks/.azuredevops/` when deployment artifact coverage matters.
-
-Identify every source anchor, business key, dependency, intermediate checkpoint, curated entity, downstream serving entity, export boundary, workflow name, and environment safety constraint. Do not silently omit a discovered path.
+Identify every source anchor, business key, transformation step, derived attribute, curated entity, and downstream path. Do not silently omit a discovered path.
 
 ## Apply the Scope Guard
 
-Use this suite for batch platform workflows whose boundary can be validated in lakehouse tables.
+Use this suite for initiatives whose full transformation chain — raw → staging → enriched → curated — can be exercised locally with synthetic data and the mock pltdata framework.
 
 ## Plan Full-Initiative Coverage
 
-Default to full-initiative coverage unless the requesting developer explicitly limits the scope to a named entity or path. Full-initiative coverage requires inspection and classification of every production transform, entity, SQL view, export, and external adapter associated with the initiative; it does not require unsafe controlled data for every notebook.
-
-For an existing initiative, reuse its setup and validation pair and configuration, preserve valid existing scenarios, and fill supported coverage gaps against the current production paths. For a new initiative or one without integration tests, create the pair and configuration for all currently implemented, supported paths. Follow the maintenance rules in `references/coverage-planning.md`.
+Default to full-initiative coverage unless the requesting developer explicitly limits scope. Full-initiative coverage requires inspection and classification of every production transform and entity associated with the initiative.
 
 Create the coverage manifest defined in `references/coverage-planning.md`. Assign every path one disposition: `CONTROLLED`, `OBSERVATIONAL`, `EXCLUDED`, or `UNVERIFIED`, with a reason for every non-controlled path.
 
-For paths that fit the configured workflow and test mode, prefer multiple independent scenarios inside the initiative's single setup and validation notebooks. Use a combined scenario as well when joins, unions, coalescing, deduplication, or cross-input behavior must be proved.
+## Choose Test Mode and Anchor
 
-Choose the earliest deterministic and safe anchor for each supported path. Prefer raw only when CQ owns it and setup is repeatable. Otherwise use staging, enriched, curated, or observational context as described in `references/test-design.md`.
+Use `controlled_test_data` for initiatives whose transformation chain can be exercised end-to-end with synthetic DataFrames. The setup script creates in-memory fixtures; the validation script runs the full transformation chain and asserts on the output.
+
+Use `observational` only when the transformation logic cannot be safely invoked (e.g., external API calls, file-system side effects that cannot be mocked).
+
+Choose the earliest safe anchor. Prefer raw when the raw ingestion is pure Python/Spark with no external dependencies. Otherwise anchor at staging or enriched.
 
 ## Preserve the Shared Suite Architecture
 
-Treat the shared suite architecture as immutable while creating or updating an initiative test. Every config entry must follow:
+Treat the runner and config schema as immutable once created. Every config entry must follow:
 
 ```text
-one setup notebook -> optional single production workflow -> one validation notebook
+one setup script -> one validation script
 ```
 
-The workflow slot runs or is skipped according to the existing controlled or observational contract. Use one setup and validation notebook pair per initiative; DEV and QUA config entries may reuse that same pair.
+Use one setup and validation script pair per initiative. Do not modify the runner, the config schema, or the execution sequence when adding a new initiative.
 
-Implement multiple scenarios inside those notebooks and pass one consolidated `setup_result`. Do not modify the shared runner, pipeline definition, config schema, or execution sequence. Do not add multiple setup notebooks, multiple workflow names, multiple validation notebooks, `target_notebooks`, or direct transformation-notebook execution.
-
-If required coverage cannot fit the contract, do not redesign the suite. Implement a lower boundary only when it still honestly satisfies the requested scope; otherwise stop and report the unsupported requirement, highest supportable boundary, excluded path, and separately approved platform change that would be required.
-
-## Choose Test Mode and Boundary
-
-Use `controlled_test_data` when CQ owns a safe writable anchor. Use `observational` when mutation is unsafe or the source is externally owned.
-
-Configure the generated tests for these pipeline behaviors:
-
-- Run controlled tests only in DEV.
-- Allow observational tests in DEV and QUA.
-
-Make the declared boundary match fatal assertions.
-
-## Configure Production Execution
-
-Treat platform transformation notebooks as source definitions rather than runtime entry points. Verify this path for every in-scope stage:
-
-```text
-source transform -> compiled function -> deployed workflow task -> platform execution
-```
-
-Set `target_job_name` for the suite runner to invoke during pipeline execution when the test mode requires it. Do not trigger the job while authoring. Never run a transformation source notebook directly with `dbutils.notebook.run`, and never add a `target_notebooks` workaround.
-
-The runner supports one production workflow invocation. Do not claim a multi-workflow boundary or change the runner to create one. For scenario 3, stop at the boundary executed by the configured job and disclose the downstream exclusion and its reason.
+If required coverage cannot fit the contract, report the unsupported requirement and the highest supportable boundary. Never redesign the shared suite as an incidental part of initiative work.
 
 ## Implement the Test
 
@@ -111,24 +84,19 @@ databricks/tests/integration/<initiative>/
 
 Register the test in `databricks/tests/integration/config/integration_tests.json`.
 
-Ensure setup is safe, deterministic, and idempotent. Pass only required context through notebook exit JSON. Ensure validation proves mappings, joins, filters, keys, identities, and the declared boundary for every supported scenario in the coverage manifest.
+Ensure setup is deterministic and idempotent. Pass only required context through the `setup_result` dictionary. Ensure validation proves mappings, joins, filters, keys, and the declared boundary for every supported scenario.
 
-When the initiative has multiple supported paths, implement one structured context containing all scenarios. Implement validation to evaluate each scenario independently, print a consolidated scenario summary, and fail once at the end if any scenario failed.
+Follow `references/notebook-patterns.md` for the exact script structure.
 
 ## Verify Before Completion
 
-Perform static checks only. Parse Python syntax without importing or executing the test notebooks. Read workflow and schema metadata when available; do not run a job to obtain verification evidence.
+Perform static checks only:
 
-- Parse `integration_tests.json` as JSON.
-- Confirm canonical config values and environment restrictions.
-- Confirm the production workflow name and required task dependency path using evidence for the current code, or report the exact pending verification.
-- Confirm the compiled functions exist for every claimed layer.
-- Confirm setup does not write directly to export folders.
-- Confirm incremental rules cannot omit controlled data.
+- Parse `integration_tests.json` as JSON and confirm it is valid.
+- Confirm canonical config values (test_type, allowed_envs, required_boundary).
 - Confirm the coverage manifest accounts for every discovered initiative path.
 - Confirm each non-controlled path has an explicit disposition and reason.
 - Confirm every claimed boundary has fatal, meaningful assertions.
-- Confirm the shared runner, pipeline, and config schema were not changed.
-- State skipped adapters, separate workflows, ownership limits, and unverified assumptions.
+- Confirm the runner and config schema were not changed after bootstrap.
 
-Report the files and coverage created or updated, repository or Shared artifacts inspected, whether compilation ran, static checks completed, and deployment evidence still pending. Explicitly state that integration tests were not executed and require deployment followed by a developer-started pipeline run. Do not describe compilation, generated assertions, or static checks as passing integration tests.
+Report files created or updated, static checks completed, and coverage status for each path. Explicitly state that integration tests were not executed and require a developer-started pipeline run.

@@ -1,87 +1,181 @@
 # Suite Runner and Configuration
 
-## Authoring and Deployment Handoff
+## Authoring and Execution Handoff
 
-The agent creates or updates repository files and checks them statically. All runner behavior below occurs during a developer-started integration pipeline run after deployment. Do not execute test notebooks, trigger workflows, launch the pipeline, or deploy files while authoring.
+The agent creates or updates repository files and checks them statically. All runner behavior occurs during a developer-started integration pipeline run after authoring.
 
 ```text
 author and statically check repository files
-  -> deploy production changes, test notebooks, and configuration
-  -> developer starts integration pipeline
-  -> setup -> optional production workflow -> validation
+  -> developer runs: python run_integration_suite.py
+  -> setup script -> validation script
 ```
 
-New or updated test notebooks and `integration_tests.json` must be deployed even when the production transforms are already in DEV. The runner's default config is `/Workspace/Shared/release/int/databricks/tests/integration/config/integration_tests.json`; editing the Git-folder copy does not update the deployed suite.
+## Bootstrap When Infrastructure Is Absent
 
-Before the developer runs the pipeline, the corresponding production functions and runtime libraries, configured job and dependencies, setup/validation notebooks, and config must be deployed. Report missing evidence as pending readiness according to `workflow-verification.md`. Do not add an automatic post-deployment trigger or new config fields.
+If `run_integration_suite.py` or `integration_tests.json` do not exist, create both. This happens once — they then become the immutable shared suite contract.
 
-Preserve `/Shared/release/int/databricks/...` notebook paths in config entries for pipeline execution. `/Workspace/Shared/...` is the filesystem path used to inspect deployed files. Shared remains read-only during authoring.
+### run_integration_suite.py
 
-## Runner Contract
+Create at `databricks/tests/integration/common/run_integration_suite.py`:
 
-Treat this contract as a shared platform standard, not an initiative-specific design choice.
+```python
+"""
+Integration test suite runner.
 
-The runner executes each selected config entry in this order:
+Usage:
+    python run_integration_suite.py [--initiative <name>] [--env <dev|qua>]
 
-```text
-setup notebook -> optional production workflow -> required validation notebook
+Reads integration_tests.json, executes each enabled entry's setup and
+validate scripts in sequence, and reports consolidated results.
+"""
+import argparse
+import importlib.util
+import json
+import os
+import sys
+import traceback
+
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../.."))
+_CONFIG = os.path.join(_ROOT, "databricks/tests/integration/config/integration_tests.json")
+_TESTS_DIR = os.path.join(_ROOT, "databricks/tests/integration")
+
+
+def _load_script(path: str) -> dict:
+    """Execute a setup or validate script and return its _result dict."""
+    spec = importlib.util.spec_from_file_location("_integration_script", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return getattr(mod, "_result", {})
+
+
+def run(initiative_filter: str | None = None, env: str = "dev") -> bool:
+    with open(_CONFIG) as f:
+        cfg = json.load(f)
+
+    entries = cfg["tests"]
+    if initiative_filter:
+        entries = [e for e in entries if e["initiative"] == initiative_filter]
+    entries = [e for e in entries if e.get("enabled", True) and env in e.get("allowed_envs", ["dev"])]
+
+    if not entries:
+        print(f"[WARN] No enabled entries found for initiative={initiative_filter!r} env={env!r}")
+        return True
+
+    results = {}
+    for entry in entries:
+        name = entry["initiative"]
+        print(f"\n{'='*60}")
+        print(f"[SUITE] {name} | env={env} | type={entry['test_type']}")
+
+        setup_path = os.path.join(_TESTS_DIR, name, f"setup_{name}.py")
+        validate_path = os.path.join(_TESTS_DIR, name, f"validate_{name}.py")
+
+        try:
+            print(f"[SETUP] {setup_path}")
+            setup_result = _load_script(setup_path)
+            print(f"[SETUP] OK — scenarios: {list(setup_result.get('scenarios', {}).keys())}")
+
+            print(f"[VALIDATE] {validate_path}")
+            sys.modules.pop("_integration_script", None)
+            import builtins
+            _original = builtins.__dict__.copy()
+            builtins.setup_result = setup_result
+            try:
+                _load_script(validate_path)
+            finally:
+                builtins.__dict__.clear()
+                builtins.__dict__.update(_original)
+
+            results[name] = "PASS"
+            print(f"[PASS] {name}")
+
+        except Exception as exc:
+            results[name] = f"FAIL: {exc}"
+            print(f"[FAIL] {name} | {exc}")
+            traceback.print_exc()
+
+    print(f"\n{'='*60}")
+    print("[SUITE SUMMARY]")
+    all_passed = True
+    for name, outcome in results.items():
+        status = "PASS" if outcome == "PASS" else "FAIL"
+        print(f"  [{status}] {name}: {outcome}")
+        if status == "FAIL":
+            all_passed = False
+
+    return all_passed
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--initiative", default=None)
+    parser.add_argument("--env", default="dev")
+    args = parser.parse_args()
+
+    ok = run(args.initiative, args.env)
+    sys.exit(0 if ok else 1)
 ```
 
-It passes `initiative`, `test_type`, `environment`, `target_job_name`, `run_target_job`, `required_boundary`, and stringified custom parameters. A non-empty setup result is passed to validation as `setup_result`.
+### integration_tests.json
 
-Controlled tests run the target job by default. Observational tests skip it by default. Add `run_target_job` only for an intentional override.
-
-The runner executes initiatives sequentially. A per-initiative exception skips that initiative's remaining stages, records the failure, and continues with later initiatives. It prints a consolidated summary and fails the suite at the end when failures exist. Configuration, environment, or test-selection failures occur before the per-initiative loop and stop the suite immediately.
-
-The runner supports one production workflow invocation per config entry. Each entry has exactly one setup notebook path and one validation notebook path. Multiple environment entries for the same initiative may reuse the same notebook pair.
-
-While adding an initiative test, do not modify:
-
-- `run_integration_suite.py`
-- the shared integration-suite pipeline
-- the `integration_tests.json` schema
-- the setup/workflow/validation execution sequence
-- the one-workflow invocation limit
-
-Do not add arrays of setup notebooks, workflow names, or validation notebooks. Do not add `target_notebooks` or direct source-notebook execution.
-
-Implement compatible initiative scenarios inside the one setup and validation pair. If required coverage cannot fit, report why, the highest supportable boundary, and the separate platform-level change that would require team approval. Never redesign the shared suite as an incidental part of initiative work.
-
-## Canonical Values
-
-- `test_type`: `controlled_test_data`, `observational`
-- `allowed_envs`: `dev`, `qua`
-- `required_boundary`: `raw`, `staging`, `enriched`, `curated`, `curated_ext`, `workspace`
-
-Use JSON booleans. Use positive integer timeouts. Use a non-empty parameters object only when custom arguments are needed.
-
-## Config Template
+Create at `databricks/tests/integration/config/integration_tests.json`:
 
 ```json
 {
-  "initiative": "example",
+  "tests": []
+}
+```
+
+## Runner Contract
+
+Once created, treat this contract as immutable:
+
+```text
+setup script -> validation script
+```
+
+The runner executes each config entry in this order:
+1. Loads and executes `setup_<initiative>.py` — collects `_result` (a dict with a `scenarios` key).
+2. Passes `setup_result` as a builtin to `validate_<initiative>.py`.
+3. Records PASS or FAIL per initiative and prints a consolidated summary.
+
+Do not modify the runner while adding an initiative test. If required coverage cannot fit the contract, report the limitation.
+
+## Config Entry Template
+
+```json
+{
+  "initiative": "mockapi_employees",
   "test_type": "controlled_test_data",
   "allowed_envs": ["dev"],
   "enabled": true,
   "required_boundary": "curated",
-  "target_job_name": "<product> int Workflow - example_int",
-  "setup_notebook": "/Shared/release/int/databricks/tests/integration/example/setup_example",
-  "validate_notebook": "/Shared/release/int/databricks/tests/integration/example/validate_example",
   "setup_timeout_seconds": 300,
-  "target_timeout_seconds": 6000,
   "validate_timeout_seconds": 600
 }
 ```
 
-Omit `run_target_job` for normal entries. Do not add `target_notebooks` for platform transformations.
+### Canonical values
 
-Validate after editing by running in a Claude Code cell:
+- `test_type`: `controlled_test_data`, `observational`
+- `allowed_envs`: `dev`, `qua`
+- `required_boundary`: `raw`, `staging`, `enriched`, `curated`
+
+Use JSON booleans. Use positive integer timeouts. Omit `target_job_name` — there is no Databricks job in the demo.
+
+## Validate JSON After Editing
 
 ```python
 import json
-with open(f"{_repo_root}/databricks/tests/integration/config/integration_tests.json") as _f:
-    _cfg = json.load(_f)
-print(f"Valid JSON — {len(_cfg['tests'])} entries")
+with open("databricks/tests/integration/config/integration_tests.json") as f:
+    cfg = json.load(f)
+print(f"Valid JSON — {len(cfg['tests'])} entries")
 ```
 
-(`_repo_root` is the value computed in the "Inspect the Repository" step in SKILL.md.)
+## Run the Suite
+
+```powershell
+# From demo/ root with pltdata on PYTHONPATH
+$env:PYTHONPATH = "$PWD;$env:PYTHONPATH"
+python databricks/tests/integration/common/run_integration_suite.py --initiative mockapi_employees --env dev
+```

@@ -173,7 +173,7 @@ _RAW_SOURCE_SCHEMA = StructType([
 ])
 
 _FIXTURE_CSV = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "../../../../data/raw/mockapi/mockapi_employees.csv")
+    os.path.join(os.path.dirname(__file__), "../../../data/raw/mockapi/mockapi_employees.csv")
 )
 
 # ---------------------------------------------------------------------------

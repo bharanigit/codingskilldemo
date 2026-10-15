@@ -1,0 +1,13 @@
+{
+  "tests": [
+    {
+      "initiative": "mockapi_employees",
+      "test_type": "controlled_test_data",
+      "allowed_envs": ["dev"],
+      "enabled": true,
+      "required_boundary": "curated",
+      "setup_timeout_seconds": 300,
+      "validate_timeout_seconds": 60
+    }
+  ]
+}
